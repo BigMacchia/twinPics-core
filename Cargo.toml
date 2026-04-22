@@ -1,0 +1,42 @@
+[package]
+name = "twinpics_core"
+version = "0.1.0"
+edition = "2021"
+description = "twinpics core — CLI and indexing"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "twinpics_cli"
+path = "src/bin/twinpics_cli.rs"
+
+[lib]
+name = "twinpics_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Opt-in CLIP integration tests in tests/real_clip_tests.rs (enables Hub download if weights missing).
+real-clip = ["mll/model-download"]
+
+[dependencies]
+# Auto-fetch CLIP weights on first use when missing (writes under ~/.twinpics/models/...).
+mll = { path = "../mll", features = ["model-download"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+
+[dev-dependencies]
+mll = { path = "../mll", features = ["mock"] }
+assert_cmd = "2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+predicates = "3"
+serial_test = "3"
+tempfile = "3"
