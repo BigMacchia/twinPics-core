@@ -14,6 +14,9 @@ pub enum CoreError {
     /// JSON (de)serialization.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// SQLite (tags database).
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     /// Invalid user input or inconsistent state.
     #[error("{0}")]
     Msg(String),

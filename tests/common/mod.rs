@@ -45,6 +45,7 @@ pub fn write_solid_png(path: &Path, rgb: [u8; 3]) {
 }
 
 /// Build a fixture tree: `root/a/`, `root/b/`, `root/c/` with 7+7+7 PNGs each (21 total).
+#[allow(dead_code)] // Not every integration test binary uses this helper.
 pub fn build_fixture_tree(root: &Path) -> Vec<PathBuf> {
     let dirs = ["a", "b", "c"];
     let mut paths = Vec::new();

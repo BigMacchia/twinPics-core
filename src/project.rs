@@ -44,6 +44,8 @@ pub struct ProjectPaths {
     pub manifest_path: PathBuf,
     /// Index metadata (model, creation time, source path).
     pub config_path: PathBuf,
+    /// SQLite DB of per-image CLIP tags (`tags.sqlite`).
+    pub tags_db_path: PathBuf,
     /// Original source folder this project indexes.
     pub source_path: PathBuf,
 }
@@ -61,6 +63,7 @@ impl ProjectPaths {
             index_path: project_dir.join("index.usearch"),
             manifest_path: project_dir.join("manifest.json"),
             config_path: project_dir.join("config.json"),
+            tags_db_path: project_dir.join("tags.sqlite"),
             project_dir,
             source_path: source,
         })
@@ -118,6 +121,7 @@ pub fn list_projects() -> Result<Vec<(ProjectPaths, ProjectConfig)>, CoreError> 
             index_path: p.join("index.usearch"),
             manifest_path: p.join("manifest.json"),
             config_path,
+            tags_db_path: p.join("tags.sqlite"),
             source_path,
         };
         out.push((paths, config));
