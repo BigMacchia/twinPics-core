@@ -1,7 +1,7 @@
 //! CLIP-based tests: run with `cargo test -p twinpics_core --features real-clip -- --ignored`.
 //! Requires CLIP weights (`model.safetensors` + `tokenizer.json`): set `TWINPICS_CLIP_MODEL_DIR`, or
 //! place them under `~/.twinpics/models/clip-vit-base-patch32/`, or let the `real-clip` feature
-//! enable `mll/model-download` to fetch from Hugging Face when missing.
+//! enable `twinpics_core/model-download` to fetch from Hugging Face when missing.
 
 #![cfg(feature = "real-clip")]
 
@@ -9,8 +9,8 @@ mod common;
 
 use std::fs;
 
-use mll::CandleClipBackend;
 use serial_test::serial;
+use twinpics_core::ml::{CandleClipBackend, EmbeddingBackend};
 use twinpics_core::{
     index_folder, project_paths_for_source, search_project_text,
     IndexOptions, SearchParams,
@@ -18,7 +18,7 @@ use twinpics_core::{
 
 use common::{build_fixture_tree, TestEnv};
 
-fn clip_backend() -> std::sync::Arc<dyn mll::EmbeddingBackend> {
+fn clip_backend() -> std::sync::Arc<dyn EmbeddingBackend> {
     std::sync::Arc::new(CandleClipBackend::new().expect("clip"))
 }
 

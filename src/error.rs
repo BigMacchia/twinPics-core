@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum CoreError {
     /// Wrapped ML layer error.
     #[error("mll: {0}")]
-    Mll(#[from] mll::MllError),
+    Mll(#[from] crate::ml::MllError),
     /// I/O error.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

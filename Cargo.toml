@@ -2,43 +2,43 @@
 name = "twinpics_core"
 version = "0.0.1"
 edition = "2021"
-description = "twinpics core — CLI and indexing"
+description = "twinpics core — indexing and search library"
 license = "MIT OR Apache-2.0"
-
-[[bin]]
-name = "twinpics_cli"
-path = "src/bin/twinpics_cli.rs"
 
 [lib]
 name = "twinpics_core"
 path = "src/lib.rs"
 
 [features]
-default = []
+# Mock embedding backend (tests + dev); integration tests need this because `cfg(test)` is not
+# set when building the `twinpics_core` rlib for `crates/**/tests/*.rs` targets.
+default = ["mock"]
+mock = []
 # Opt-in CLIP integration tests in tests/real_clip_tests.rs (enables Hub download if weights missing).
-real-clip = ["mll/model-download"]
+model-download = ["dep:hf-hub"]
+real-clip = ["model-download"]
 
 [dependencies]
-# Auto-fetch CLIP weights on first use when missing (writes under ~/.twinpics/models/...).
-mll = { path = "../mll", features = ["model-download"] }
-anyhow = "1"
+# Optional: fetch CLIP weights from Hugging Face when not found on disk (`model-download` feature).
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+# default `esaxx_fast` pulls esaxx-rs/cpp with static_crt on MSVC, which LNK2038-conflicts with cxx (usearch).
+tokenizers = { version = "0.20", default-features = false, features = ["onig", "progressbar"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
+usearch = "2.25"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
 dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
-indicatif = "0.17"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 
 [dev-dependencies]
-mll = { path = "../mll", features = ["mock"] }
-assert_cmd = "2"
 image = { version = "0.25", default-features = false, features = ["png"] }
-predicates = "3"
 serial_test = "3"
 tempfile = "3"

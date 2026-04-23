@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use image::{ImageBuffer, Rgb};
-use mll::MockEmbeddingBackend;
+use twinpics_core::ml::{EmbeddingBackend, MockEmbeddingBackend};
 use tempfile::TempDir;
 
 /// Temp project root + env var set for twinpics.
@@ -34,7 +34,7 @@ impl Drop for TestEnv {
 
 /// Mock backend wrapped for indexing tests.
 #[allow(dead_code)] // Used only by integration tests that import `common`; not every test binary uses it.
-pub fn mock_backend() -> Arc<dyn mll::EmbeddingBackend> {
+pub fn mock_backend() -> Arc<dyn EmbeddingBackend> {
     Arc::new(MockEmbeddingBackend::new())
 }
 

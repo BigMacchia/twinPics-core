@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mll::{load_index, search_index, EmbeddingBackend};
+use crate::ml::{load_index, search_index, EmbeddingBackend};
 
 use crate::error::CoreError;
 use crate::manifest::Manifest;

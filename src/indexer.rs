@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use mll::{build_index, save_index, EmbeddingBackend};
+use crate::ml::{build_index, save_index, EmbeddingBackend};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -197,7 +197,7 @@ pub fn index_folder(
     let t_process = Instant::now();
     let old_manifest = Manifest::load_or_empty(&paths.manifest_path)?;
     let old_index = if paths.index_path.is_file() {
-        Some(mll::load_index(&paths.index_path)?)
+        Some(crate::ml::load_index(&paths.index_path)?)
     } else {
         None
     };
@@ -232,7 +232,7 @@ pub fn index_folder(
             let n = idx
                 .export(key, &mut v)
                 .map_err(|e| CoreError::msg(format!("index export: {e}")))?;
-            if n == 0 || v.len() != mll::CLIP_EMBED_DIM {
+            if n == 0 || v.len() != crate::ml::CLIP_EMBED_DIM {
                 backend.embed_image(path)?
             } else {
                 v
@@ -395,7 +395,7 @@ mod progress_tests {
     use std::sync::{Arc, Mutex};
 
     use image::{ImageBuffer, Rgb};
-    use mll::MockEmbeddingBackend;
+    use crate::ml::MockEmbeddingBackend;
     use serial_test::serial;
     use tempfile::tempdir;
 

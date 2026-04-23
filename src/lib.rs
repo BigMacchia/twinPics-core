@@ -1,15 +1,18 @@
 //! twinpics core: indexing, search orchestration, and project layout.
 //!
-//! The `twinpics_cli` binary lives in `src/bin/twinpics_cli.rs`. Library users typically call
+//! The `twinpics_cli` binary lives in `crates/cli`. Library users typically call
 //! [`index_folder`], [`search_project_text`], and [`search_project_image`] with an
-//! [`std::sync::Arc`] to an [`mll::EmbeddingBackend`]. Indexing optionally writes CLIP-derived
+//! [`std::sync::Arc`] to an [`ml::EmbeddingBackend`]. Indexing optionally writes CLIP-derived
 //! tags to [`tags::TagsDb`] (`tags.sqlite` in the project directory).
 
 #![warn(missing_docs)]
 
+pub mod db;
 pub mod error;
 pub mod indexer;
 pub mod manifest;
+/// CLIP embeddings and vector index (merged from the former `mll` crate).
+pub mod ml;
 pub mod project;
 pub mod search;
 pub mod tags;

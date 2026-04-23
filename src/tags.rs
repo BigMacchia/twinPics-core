@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mll::EmbeddingBackend;
+use crate::ml::EmbeddingBackend;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -91,7 +91,7 @@ pub fn tags_for_image(
     vocab_vecs: &[Vec<f32>],
     threshold: f32,
 ) -> Vec<(String, f32)> {
-    let dim = mll::CLIP_EMBED_DIM;
+    let dim = crate::ml::CLIP_EMBED_DIM;
     let mut scored: Vec<(String, f32)> = Vec::new();
     for (name, tv) in vocab.iter().zip(vocab_vecs.iter()) {
         if image_vec.len() != dim || tv.len() != dim {
