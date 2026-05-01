@@ -17,6 +17,8 @@ mock = []
 # Opt-in CLIP integration tests in tests/real_clip_tests.rs (enables Hub download if weights missing).
 model-download = ["dep:hf-hub"]
 real-clip = ["model-download"]
+# PDF page rendering via pdfium (requires pdfium.dll / libpdfium.so at runtime).
+pdf = ["dep:pdfium-render"]
 
 [dependencies]
 # Optional: fetch CLIP weights from Hugging Face when not found on disk (`model-download` feature).
@@ -37,6 +39,8 @@ sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 walkdir = "2"
+rayon = "1"
+pdfium-render = { version = "0.8", features = ["image"], optional = true }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

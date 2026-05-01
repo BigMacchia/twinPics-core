@@ -17,8 +17,10 @@ pub struct SearchHit {
     pub rank: usize,
     /// Cosine similarity score.
     pub score: f32,
-    /// Absolute path to the image file.
+    /// Absolute path to the matched file (PDF path for PDF hits, image path otherwise).
     pub path: PathBuf,
+    /// 0-based page index when the hit came from a PDF page; `None` for regular images.
+    pub pdf_page: Option<u32>,
 }
 
 /// Parameters for `search_project`.
@@ -71,10 +73,20 @@ fn search_project_with_query(
     let index = load_index(&paths.index_path)?;
 
     let mut id_to_path: HashMap<u64, PathBuf> = HashMap::new();
+    let mut id_to_pdf_page: HashMap<u64, u32> = HashMap::new();
     for e in &manifest.entries {
-        let rel = std::path::PathBuf::from(e.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let abs = paths.source_path.join(rel);
+        let abs = if let Some(ref pdf_rel) = e.pdf_source {
+            // PDF page: return the source PDF file, not the rendered PNG.
+            let rel = PathBuf::from(pdf_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            paths.source_path.join(rel)
+        } else {
+            let rel = PathBuf::from(e.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            paths.source_path.join(rel)
+        };
         id_to_path.insert(e.embedding_id, abs);
+        if let Some(page) = e.pdf_page {
+            id_to_pdf_page.insert(e.embedding_id, page);
+        }
     }
 
     let results = search_index(&index, query, params.output_max, params.min_score)?;
@@ -89,6 +101,7 @@ fn search_project_with_query(
             rank: i + 1,
             score: r.score,
             path,
+            pdf_page: id_to_pdf_page.get(&r.key).copied(),
         });
     }
     Ok(hits)

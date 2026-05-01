@@ -71,16 +71,17 @@ fn parse_vocab_lines(s: &str) -> Result<Vec<String>, CoreError> {
 }
 
 /// Embed each vocabulary term as its own CLIP text vector (L2-normalised by the backend).
+/// Runs in parallel (rayon) since the backend is `Send + Sync`.
 pub fn embed_vocab(
     backend: &dyn EmbeddingBackend,
     vocab: &[String],
 ) -> Result<Vec<Vec<f32>>, CoreError> {
-    let mut out = Vec::with_capacity(vocab.len());
-    for term in vocab {
-        let v = backend.embed_text(&[term.as_str()])?;
-        out.push(v);
-    }
-    Ok(out)
+    use rayon::prelude::*;
+    let results: Vec<Result<Vec<f32>, CoreError>> = vocab
+        .par_iter()
+        .map(|term| Ok(backend.embed_text(&[term.as_str()])?))
+        .collect();
+    results.into_iter().collect()
 }
 
 /// Cosine similarity (dot product) between L2-normalised `image_vec` and each vocab vector;

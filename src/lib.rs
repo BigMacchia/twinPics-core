@@ -10,6 +10,8 @@
 pub mod db;
 pub mod error;
 pub mod indexer;
+#[cfg(feature = "pdf")]
+pub mod pdf;
 pub mod manifest;
 /// CLIP embeddings and vector index (merged from the former `mll` crate).
 pub mod ml;

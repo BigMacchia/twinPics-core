@@ -48,6 +48,8 @@ pub struct ProjectPaths {
     pub tags_db_path: PathBuf,
     /// Original source folder this project indexes.
     pub source_path: PathBuf,
+    /// Cache directory for rendered PDF page images: `<project_dir>/pdf_renders/`.
+    pub pdf_renders_path: PathBuf,
 }
 
 impl ProjectPaths {
@@ -64,6 +66,7 @@ impl ProjectPaths {
             manifest_path: project_dir.join("manifest.json"),
             config_path: project_dir.join("config.json"),
             tags_db_path: project_dir.join("tags.sqlite"),
+            pdf_renders_path: project_dir.join("pdf_renders"),
             project_dir,
             source_path: source,
         })
@@ -122,6 +125,7 @@ pub fn list_projects() -> Result<Vec<(ProjectPaths, ProjectConfig)>, CoreError> 
             manifest_path: p.join("manifest.json"),
             config_path,
             tags_db_path: p.join("tags.sqlite"),
+            pdf_renders_path: p.join("pdf_renders"),
             source_path,
         };
         out.push((paths, config));

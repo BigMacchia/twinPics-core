@@ -10,14 +10,25 @@ use crate::error::CoreError;
 /// One indexed file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestEntry {
-    /// Path relative to the source root, POSIX-style for serialisation.
+    /// Path relative to the source root, POSIX-style for regular images.
+    /// For PDF page entries: absolute path to the rendered PNG in `pdf_renders/`.
     pub rel_path: String,
     /// File modification time (seconds since UNIX epoch).
+    /// For PDF pages: mtime of the source PDF.
     pub mtime_secs: i64,
     /// SHA-256 hex digest of file contents.
+    /// For PDF pages: digest of the source PDF.
     pub sha256: String,
     /// Key in the usearch index (0..n-1 after rebuild).
     pub embedding_id: u64,
+    /// POSIX relative path of the source PDF within the indexed folder.
+    /// `None` for regular image entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_source: Option<String>,
+    /// 0-based page index within the source PDF.
+    /// `None` for regular image entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_page: Option<u32>,
 }
 
 /// Manifest file contents.

@@ -50,6 +50,7 @@ impl CandleClipBackend {
                 }
             }
         };
+        eprintln!("  Loading model from disk…");
         Self::load_from_dir(&dir)
     }
 
@@ -130,6 +131,9 @@ fn download_clip_weights_to(dir: &Path) -> Result<(), MllError> {
         hf_hub::RepoType::Model,
         HF_REVISION.to_string(),
     ));
+
+    eprintln!("Downloading CLIP weights from Hugging Face (~600 MB, one-time)…");
+
     let model_src = repo
         .get("model.safetensors")
         .map_err(|e| MllError::HfHub(format!("model.safetensors: {e}")))?;
@@ -140,11 +144,14 @@ fn download_clip_weights_to(dir: &Path) -> Result<(), MllError> {
     let model_dst = dir.join("model.safetensors");
     let tok_dst = dir.join("tokenizer.json");
     if !model_dst.is_file() {
+        eprintln!("  Saving model.safetensors…");
         fs::copy(&model_src, &model_dst)?;
     }
     if !tok_dst.is_file() {
+        eprintln!("  Saving tokenizer.json…");
         fs::copy(&tok_src, &tok_dst)?;
     }
+    eprintln!("  Done. Weights saved to {}", dir.display());
     Ok(())
 }
 

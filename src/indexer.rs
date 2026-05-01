@@ -1,10 +1,13 @@
 //! Walk a folder, embed images, build usearch index and project files.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+use rayon::prelude::*;
 
 use chrono::Utc;
 use crate::ml::{build_index, save_index, EmbeddingBackend};
@@ -17,6 +20,8 @@ use crate::project::{ProjectConfig, ProjectPaths};
 use crate::tags::{
     compute_vocab_hash, embed_vocab, load_vocab, tags_for_image, TagsDb,
 };
+#[cfg(feature = "pdf")]
+use crate::pdf::{load_pdfium, render_pdf_pages};
 
 /// Supported image extensions (lowercase, no dot).
 pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
@@ -26,6 +31,11 @@ pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
 pub enum IndexProgress {
     /// About to walk the directory tree to find images (no `total` yet).
     Scanning,
+    /// One image file found during scanning; `count` is the running total so far.
+    FileDiscovered {
+        /// Running count of image files found so far.
+        count: usize,
+    },
     /// Image files discovered; `total` is the number of files to process.
     Discovered {
         /// Number of image files to index.
@@ -123,6 +133,29 @@ fn is_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_pdf_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+}
+
+/// One embeddable unit: either a plain image or a rendered PDF page.
+struct FileEntry {
+    /// Path passed to `backend.embed_image()`. For PDF pages: the rendered PNG.
+    embed_path: PathBuf,
+    /// Manifest key. For images: POSIX relative path. For PDF pages: absolute path string.
+    rel_path: String,
+    /// SHA-256 of the source file. For PDF pages: digest of the source PDF.
+    sha256: String,
+    /// mtime of the source file. For PDF pages: mtime of the source PDF.
+    mtime_secs: i64,
+    /// POSIX relative path of source PDF, or `None` for plain images.
+    pdf_source: Option<String>,
+    /// 0-based page index within the PDF, or `None` for plain images.
+    pdf_page: Option<u32>,
+}
+
 fn hash_file(path: &Path) -> Result<String, CoreError> {
     let bytes = fs::read(path)?;
     let h = Sha256::digest(&bytes);
@@ -166,80 +199,244 @@ pub fn index_folder(
     }
 
     let t_scan = Instant::now();
-    let mut collected: Vec<PathBuf> = if opts.recursive {
-        WalkDir::new(&source)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.path().to_path_buf())
-            .filter(|p| is_image(p))
-            .collect()
+    let mut image_paths: Vec<PathBuf> = Vec::new();
+    let mut pdf_paths: Vec<PathBuf> = Vec::new();
+    let mut discovered_count = 0usize;
+
+    if opts.recursive {
+        for entry in WalkDir::new(&source).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                let path = entry.path().to_path_buf();
+                if is_image(&path) {
+                    image_paths.push(path);
+                    discovered_count += 1;
+                    if let Some(ref cb) = opts.on_progress {
+                        cb(IndexProgress::FileDiscovered { count: discovered_count });
+                    }
+                } else if is_pdf_file(&path) {
+                    pdf_paths.push(path);
+                    discovered_count += 1;
+                    if let Some(ref cb) = opts.on_progress {
+                        cb(IndexProgress::FileDiscovered { count: discovered_count });
+                    }
+                }
+            }
+        }
     } else {
-        fs::read_dir(&source)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && is_image(p))
-            .collect()
+        for entry in fs::read_dir(&source)?.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() {
+                if is_image(&path) {
+                    image_paths.push(path);
+                    discovered_count += 1;
+                    if let Some(ref cb) = opts.on_progress {
+                        cb(IndexProgress::FileDiscovered { count: discovered_count });
+                    }
+                } else if is_pdf_file(&path) {
+                    pdf_paths.push(path);
+                    discovered_count += 1;
+                    if let Some(ref cb) = opts.on_progress {
+                        cb(IndexProgress::FileDiscovered { count: discovered_count });
+                    }
+                }
+            }
+        }
+    }
+    image_paths.sort();
+    pdf_paths.sort();
+
+    // ── Phase A: parallel hash + mtime for images and PDFs ──────────────────
+    let image_meta_results: Vec<Result<(String, String, i64), CoreError>> = image_paths
+        .par_iter()
+        .map(|path| {
+            let rel = rel_path_posix(&source, path)?;
+            let hash = hash_file(path)?;
+            let mtime = mtime_secs(path)?;
+            Ok((rel, hash, mtime))
+        })
+        .collect();
+    let image_metas: Vec<(String, String, i64)> =
+        image_meta_results.into_iter().collect::<Result<_, _>>()?;
+
+    // ── PDF rendering: sequential (pdfium page rendering is single-threaded) ─
+    #[cfg(feature = "pdf")]
+    let pdf_page_entries: Vec<FileEntry> = {
+        if pdf_paths.is_empty() {
+            Vec::new()
+        } else {
+            // Hash PDFs in parallel to get cache keys, then render pages sequentially.
+            let pdf_meta_results: Vec<Result<(String, String, i64), CoreError>> = pdf_paths
+                .par_iter()
+                .map(|path| {
+                    let rel = rel_path_posix(&source, path)?;
+                    let hash = hash_file(path)?;
+                    let mtime = mtime_secs(path)?;
+                    Ok((rel, hash, mtime))
+                })
+                .collect();
+            let pdf_metas: Vec<(String, String, i64)> =
+                pdf_meta_results.into_iter().collect::<Result<_, _>>()?;
+
+            let pdfium = load_pdfium()?;
+            let mut entries = Vec::new();
+            for (pdf_path, (pdf_rel, hash, mtime)) in pdf_paths.iter().zip(pdf_metas.iter()) {
+                let rendered = render_pdf_pages(
+                    &pdfium, pdf_path, hash, &paths.pdf_renders_path, false,
+                )?;
+                for page in rendered {
+                    let abs_str = page.png_path.to_string_lossy().into_owned();
+                    entries.push(FileEntry {
+                        embed_path: page.png_path,
+                        rel_path: abs_str,
+                        sha256: hash.clone(),
+                        mtime_secs: *mtime,
+                        pdf_source: Some(pdf_rel.clone()),
+                        pdf_page: Some(page.page_index),
+                    });
+                }
+            }
+            entries
+        }
     };
 
-    collected.sort();
-    if collected.len() < 20 {
-        // Spec asks for 20+ images in some tests; we still allow smaller sets for dev.
-    }
+    #[cfg(not(feature = "pdf"))]
+    let pdf_page_entries: Vec<FileEntry> = {
+        if !pdf_paths.is_empty() {
+            tracing::warn!(
+                "{} PDF file(s) found but skipped (compile with `--features pdf` to index PDFs)",
+                pdf_paths.len()
+            );
+        }
+        Vec::new()
+    };
+
+    // Combine: images first (stable sorted order), then PDF pages (ordered by file, then page).
+    let mut all_entries: Vec<FileEntry> = image_paths
+        .into_iter()
+        .zip(image_metas.into_iter())
+        .map(|(path, (rel, hash, mtime))| FileEntry {
+            embed_path: path,
+            rel_path: rel,
+            sha256: hash,
+            mtime_secs: mtime,
+            pdf_source: None,
+            pdf_page: None,
+        })
+        .collect();
+    all_entries.extend(pdf_page_entries);
 
     let scan_ms = t_scan.elapsed().as_millis() as u64;
-    let total = collected.len();
+    let total = all_entries.len();
     if let Some(ref cb) = opts.on_progress {
         cb(IndexProgress::Discovered { total, scan_ms });
     }
-    let mut total_elapsed_ms: u128 = 0;
 
     let t_process = Instant::now();
     let old_manifest = Manifest::load_or_empty(&paths.manifest_path)?;
+    // O(1) lookup by rel_path instead of O(n) linear scan per file.
+    let manifest_index: HashMap<&str, &ManifestEntry> =
+        old_manifest.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
     let old_index = if paths.index_path.is_file() {
         Some(crate::ml::load_index(&paths.index_path)?)
     } else {
         None
     };
 
-    let mut embeddings: Vec<(PathBuf, Vec<f32>)> = Vec::with_capacity(collected.len());
-    let mut manifest_entries: Vec<ManifestEntry> = Vec::with_capacity(collected.len());
-
-    for (i, path) in collected.iter().enumerate() {
-        if let Some(ref cb) = opts.on_progress {
-            cb(IndexProgress::FileStarted {
-                index: i,
-                total,
-                path: path.clone(),
-            });
-        }
-        let t0 = Instant::now();
-
-        let rel = rel_path_posix(&source, path)?;
-        let hash = hash_file(path)?;
-        let mtime = mtime_secs(path)?;
-
-        let skip_embed = old_manifest.find_by_rel_path(&rel).and_then(|e| {
-            if e.sha256 == hash && e.mtime_secs == mtime {
-                Some(e.embedding_id)
+    // ── Phase B: sequential manifest check + cached embed export ────────────
+    // Kept sequential to avoid concurrent usearch index access.
+    // Fires FileFinished immediately for files whose embedding is reused.
+    let t_wall = Instant::now();
+    let done_counter = Arc::new(AtomicU64::new(0));
+    let mut cached_vecs: Vec<Option<Vec<f32>>> = Vec::with_capacity(total);
+    for entry in &all_entries {
+        let cached = manifest_index.get(entry.rel_path.as_str()).and_then(|me| {
+            if me.sha256 == entry.sha256 && me.mtime_secs == entry.mtime_secs {
+                // For PDF pages: also verify the rendered PNG still exists on disk.
+                if entry.pdf_page.is_some() && !entry.embed_path.is_file() {
+                    return None;
+                }
+                let idx = old_index.as_ref()?;
+                let mut v = Vec::new();
+                idx.export(me.embedding_id, &mut v)
+                   .ok()
+                   .filter(|&n| n > 0 && v.len() == crate::ml::CLIP_EMBED_DIM)
+                   .map(|_| v)
             } else {
                 None
             }
         });
-
-        let vec = if let (Some(key), Some(ref idx)) = (skip_embed, &old_index) {
-            let mut v = Vec::new();
-            let n = idx
-                .export(key, &mut v)
-                .map_err(|e| CoreError::msg(format!("index export: {e}")))?;
-            if n == 0 || v.len() != crate::ml::CLIP_EMBED_DIM {
-                backend.embed_image(path)?
-            } else {
-                v
+        if cached.is_some() {
+            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let wall_ms = t_wall.elapsed().as_millis() as u64;
+            let avg_ms = if done > 1 { wall_ms as f64 / done as f64 } else { 0.0 };
+            let remaining = total.saturating_sub(done as usize);
+            let eta_ms = (avg_ms * remaining as f64) as u64;
+            if let Some(ref cb) = opts.on_progress {
+                cb(IndexProgress::FileFinished {
+                    index: (done - 1) as usize,
+                    total,
+                    path: entry.embed_path.clone(),
+                    elapsed_ms: 0,
+                    avg_ms,
+                    eta_ms,
+                });
             }
-        } else {
-            backend.embed_image(path)?
-        };
+        }
+        cached_vecs.push(cached);
+    }
+
+    // ── Phase C: parallel embed for uncached files ───────────────────────────
+    let to_embed: Vec<(usize, PathBuf)> = all_entries
+        .iter()
+        .zip(cached_vecs.iter())
+        .enumerate()
+        .filter(|(_, (_, c))| c.is_none())
+        .map(|(i, (entry, _))| (i, entry.embed_path.clone()))
+        .collect();
+
+    let dc = done_counter.clone();
+    let new_embed_results: Vec<Result<(usize, Vec<f32>), CoreError>> = to_embed
+        .par_iter()
+        .map(|(idx, path)| {
+            if let Some(ref cb) = opts.on_progress {
+                cb(IndexProgress::FileStarted { index: *idx, total, path: path.clone() });
+            }
+            let t0 = Instant::now();
+            let vec = backend.embed_image(path)?;
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            let done = dc.fetch_add(1, Ordering::Relaxed) + 1;
+            let wall_ms = t_wall.elapsed().as_millis() as u64;
+            let avg_ms = wall_ms as f64 / done as f64;
+            let remaining = total.saturating_sub(done as usize);
+            let eta_ms = (avg_ms * remaining as f64) as u64;
+            if let Some(ref cb) = opts.on_progress {
+                cb(IndexProgress::FileFinished {
+                    index: (done - 1) as usize,
+                    total,
+                    path: path.clone(),
+                    elapsed_ms,
+                    avg_ms,
+                    eta_ms,
+                });
+            }
+            Ok((*idx, vec))
+        })
+        .collect();
+
+    for res in new_embed_results {
+        let (idx, vec) = res?;
+        cached_vecs[idx] = Some(vec);
+    }
+
+    let process_ms = t_process.elapsed().as_millis() as u64;
+
+    // ── Phase D: tags, SQLite writes, manifest collection ───────────────────
+    // Sequential: TagsDb requires &mut self; manifest ordering must be stable.
+    let mut embeddings: Vec<(PathBuf, Vec<f32>)> = Vec::with_capacity(total);
+    let mut manifest_entries: Vec<ManifestEntry> = Vec::with_capacity(total);
+
+    for (i, (entry, opt_vec)) in all_entries.iter().zip(cached_vecs.iter()).enumerate() {
+        let vec = opt_vec.as_ref().expect("all embeddings resolved in phase C");
 
         if let Some(ref mut db) = tags_db_opt {
             if vocab_cache.is_none() {
@@ -252,38 +449,21 @@ pub fn index_folder(
                 vocab_cache = Some((vocab, vocab_vecs));
             }
             let (vocab, vocab_vecs) = vocab_cache.as_ref().expect("vocabulary initialised");
-            let assigned = tags_for_image(&vec, vocab, vocab_vecs, opts.tag_threshold);
-            db.upsert_image_tags(&rel, &assigned)?;
+            let assigned = tags_for_image(vec, vocab, vocab_vecs, opts.tag_threshold);
+            db.upsert_image_tags(&entry.rel_path, &assigned)?;
         }
 
-        let id = embeddings.len() as u64;
-        embeddings.push((path.clone(), vec));
+        let id = i as u64;
+        embeddings.push((entry.embed_path.clone(), vec.clone()));
         manifest_entries.push(ManifestEntry {
-            rel_path: rel,
-            mtime_secs: mtime,
-            sha256: hash,
+            rel_path: entry.rel_path.clone(),
+            mtime_secs: entry.mtime_secs,
+            sha256: entry.sha256.clone(),
             embedding_id: id,
+            pdf_source: entry.pdf_source.clone(),
+            pdf_page: entry.pdf_page,
         });
-
-        if let Some(ref cb) = opts.on_progress {
-            let elapsed_ms = t0.elapsed().as_millis() as u64;
-            total_elapsed_ms += elapsed_ms as u128;
-            let done = i + 1;
-            let avg_ms = total_elapsed_ms as f64 / done as f64;
-            let remaining = total.saturating_sub(done);
-            let eta_ms = (avg_ms * remaining as f64) as u64;
-            cb(IndexProgress::FileFinished {
-                index: i,
-                total,
-                path: path.clone(),
-                elapsed_ms,
-                avg_ms,
-                eta_ms,
-            });
-        }
     }
-
-    let process_ms = t_process.elapsed().as_millis() as u64;
 
     if let Some(ref cb) = opts.on_progress {
         cb(IndexProgress::Finishing);
@@ -467,27 +647,37 @@ mod progress_tests {
         assert!(outcome.total_ms >= outcome.finalize_ms);
 
         let v = acc.lock().expect("lock");
-        let mut i = 0;
-        assert!(matches!(&v[i], IndexProgress::Scanning));
-        i += 1;
-        assert!(matches!(&v[i], IndexProgress::Discovered { total, .. } if *total == n));
-        i += 1;
-        for idx in 0..n {
-            assert!(matches!(
-                &v[i],
-                IndexProgress::FileStarted { index, total, .. } if *index == idx && *total == n
-            ));
-            i += 1;
-            assert!(matches!(
-                &v[i],
-                IndexProgress::FileFinished { index, total, .. } if *index == idx && *total == n
-            ));
-            i += 1;
+        // Scanning fires first.
+        assert!(matches!(&v[0], IndexProgress::Scanning), "expected Scanning at [0]");
+        // Some number of FileDiscovered events follow (one per image found).
+        let discovered_pos = v
+            .iter()
+            .position(|e| matches!(e, IndexProgress::Discovered { .. }))
+            .expect("Discovered event missing");
+        // All events between Scanning and Discovered must be FileDiscovered.
+        for ev in &v[1..discovered_pos] {
+            assert!(
+                matches!(ev, IndexProgress::FileDiscovered { .. }),
+                "unexpected event between Scanning and Discovered: {ev:?}"
+            );
         }
-        assert!(matches!(&v[i], IndexProgress::Finishing));
-        i += 1;
-        assert!(matches!(&v[i], IndexProgress::Done));
-        i += 1;
-        assert_eq!(i, v.len());
+        assert!(
+            matches!(&v[discovered_pos], IndexProgress::Discovered { total, .. } if *total == n)
+        );
+        // After Discovered: n FileFinished events (parallel order, not necessarily sequential).
+        let finished_count = v
+            .iter()
+            .filter(|e| matches!(e, IndexProgress::FileFinished { .. }))
+            .count();
+        assert_eq!(finished_count, n, "expected {n} FileFinished events");
+        // Finishing then Done close the sequence.
+        let finishing_pos = v
+            .iter()
+            .position(|e| matches!(e, IndexProgress::Finishing))
+            .expect("Finishing event missing");
+        assert!(
+            matches!(&v[finishing_pos + 1], IndexProgress::Done),
+            "expected Done after Finishing"
+        );
     }
 }
