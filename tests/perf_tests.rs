@@ -10,6 +10,15 @@
 //!                      is ignored.
 //!   TWINPICS_CLIP_MODEL_DIR  Directory containing model.safetensors +
 //!                            tokenizer.json (checked by the backend).
+//!
+//! ## Comparing CLI vs desktop index speed (manual)
+//!
+//! - Use **release** builds: `cargo build --release -p twinpics_cli` and a release desktop bundle.
+//! - **PDF feature parity**: the CLI crate depends on `twinpics_core` without the `pdf` feature; the
+//!   desktop crate enables `pdf`. If the folder contains PDFs, desktop does extra work unless you
+//!   align features or exclude PDFs from the test folder.
+//! - Example photo root: `D:\Marco\photos\2024` — set `TWINPICS_PERF_SRC` or use synthetic images (default).
+//! - CLI prints total/scan/process/write ms; desktop `add_index` returns the same timing fields in its summary.
 
 #![cfg(feature = "real-clip")]
 
@@ -17,6 +26,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -321,5 +331,126 @@ fn perf_index_cold_and_warm() {
         "warm process ({} ms) must not exceed cold process ({} ms)",
         warm.process_ms,
         cold.process_ms
+    );
+}
+
+/// Mirrors desktop `add_index_work` progress filtering: skip `FileDiscovered` / `FileStarted`,
+/// throttle `FileFinished` (~100 ms) with an atomic — no Tauri `emit`.
+fn ui_like_throttle_allow(last_emit_ms: &AtomicU64, throttle_ms: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut prev = last_emit_ms.load(Ordering::Relaxed);
+    loop {
+        if prev != 0 && now.saturating_sub(prev) < throttle_ms {
+            return false;
+        }
+        match last_emit_ms.compare_exchange_weak(prev, now, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(p) => prev = p,
+        }
+    }
+}
+
+fn ui_like_progress_callback() -> (ProgressCallback, Arc<AtomicUsize>) {
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let last_emit_ms = Arc::new(AtomicU64::new(0));
+    let e = emitted.clone();
+    let cb: ProgressCallback = Arc::new(move |p: IndexProgress| {
+        match &p {
+            IndexProgress::FileDiscovered { .. } | IndexProgress::FileStarted { .. } => return,
+            _ => {}
+        }
+        let always = matches!(
+            p,
+            IndexProgress::Scanning
+                | IndexProgress::Discovered { .. }
+                | IndexProgress::Finishing
+                | IndexProgress::Done
+        );
+        const THROTTLE_MS: u64 = 100;
+        if !always && !ui_like_throttle_allow(last_emit_ms.as_ref(), THROTTLE_MS) {
+            return;
+        }
+        let counts = matches!(
+            p,
+            IndexProgress::Scanning
+                | IndexProgress::Discovered { .. }
+                | IndexProgress::FileFinished { .. }
+                | IndexProgress::Finishing
+                | IndexProgress::Done
+        );
+        if counts {
+            e.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    (cb, emitted)
+}
+
+/// Ensures a desktop-shaped progress callback does not materially slow `index_folder` vs no callback.
+///
+/// Run with:
+///   $env:TWINPICS_PERF_SRC = "D:\Marco\photos\2024"
+///   cargo test -p twinpics_core --features real-clip -- --ignored --nocapture perf_ui_progress_callback_overhead
+#[test]
+#[serial]
+#[ignore = "performance test — requires CLIP weights; run with --ignored --nocapture"]
+fn perf_ui_progress_callback_overhead() {
+    let _env = TestEnv::new();
+    let (src, _synthetic) = resolve_source(&_env);
+    let paths = project_paths_for_source(&src).unwrap();
+
+    twinpics_core::clean_project(&src).ok();
+
+    let backend_none = clip_backend();
+    let baseline = index_folder(
+        &src,
+        backend_none,
+        &paths,
+        IndexOptions {
+            on_progress: None,
+            ..Default::default()
+        },
+    )
+    .expect("baseline index_folder failed");
+
+    twinpics_core::clean_project(&src).ok();
+
+    let backend_ui = clip_backend();
+    let (ui_cb, emit_count) = ui_like_progress_callback();
+    let with_ui_cb = index_folder(
+        &src,
+        backend_ui,
+        &paths,
+        IndexOptions {
+            on_progress: Some(ui_cb),
+            ..Default::default()
+        },
+    )
+    .expect("ui_like index_folder failed");
+
+    println!(
+        "\n╔══ perf_ui_progress_callback_overhead ══╗\n  source: {}\n  baseline total_ms: {}\n  ui_like total_ms:  {}\n  simulated emits: {}\n╚════════════════════════════════════════╝\n",
+        src.display(),
+        baseline.total_ms,
+        with_ui_cb.total_ms,
+        emit_count.load(Ordering::Relaxed)
+    );
+
+    assert_eq!(
+        baseline.file_count, with_ui_cb.file_count,
+        "file_count must match between runs"
+    );
+    assert!(
+        emit_count.load(Ordering::Relaxed) > 0,
+        "ui_like callback should record at least one progress step"
+    );
+
+    assert!(
+        with_ui_cb.total_ms <= baseline.total_ms.max(1).saturating_mul(2),
+        "ui_like total_ms ({}) should not roughly double baseline ({} ms)",
+        with_ui_cb.total_ms,
+        baseline.total_ms
     );
 }
