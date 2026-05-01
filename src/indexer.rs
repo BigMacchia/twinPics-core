@@ -17,6 +17,7 @@ use walkdir::WalkDir;
 use crate::error::CoreError;
 use crate::manifest::{rel_path_posix, Manifest, ManifestEntry};
 use crate::project::{ProjectConfig, ProjectPaths};
+use crate::color::extract_dominant_colors;
 use crate::tags::{
     compute_vocab_hash, embed_vocab, load_vocab, tags_for_image, TagsDb,
 };
@@ -106,6 +107,9 @@ pub struct IndexOptions {
     pub tag_threshold: f32,
     /// When true, do not build or update `tags.sqlite` (and remove an existing DB).
     pub skip_tagging: bool,
+    /// When true (default), extract dominant colors and store them in `tags.sqlite`.
+    /// Has no effect when `skip_tagging` is true.
+    pub extract_colors: bool,
     /// Optional progress hook (e.g. CLI bar or Tauri events).
     pub on_progress: Option<ProgressCallback>,
 }
@@ -118,6 +122,7 @@ impl Default for IndexOptions {
             tags_file: None,
             tag_threshold: 0.22,
             skip_tagging: false,
+            extract_colors: true,
             on_progress: None,
         }
     }
@@ -385,6 +390,9 @@ pub fn index_folder(
         cached_vecs.push(cached);
     }
 
+    // Track which entries need fresh color extraction (no cached embedding found).
+    let was_new_embed: Vec<bool> = cached_vecs.iter().map(|v| v.is_none()).collect();
+
     // ── Phase C: parallel embed for uncached files ───────────────────────────
     let to_embed: Vec<(usize, PathBuf)> = all_entries
         .iter()
@@ -430,6 +438,48 @@ pub fn index_folder(
 
     let process_ms = t_process.elapsed().as_millis() as u64;
 
+    // ── Phase C2: parallel color extraction ─────────────────────────────────
+    // CPU-bound image decode + k-means runs in parallel before the sequential
+    // Phase D SQLite writes, so extraction overlaps across all CPU cores.
+    let color_cached_paths: HashSet<String> =
+        if opts.extract_colors && tags_db_opt.is_some() {
+            tags_db_opt
+                .as_ref()
+                .unwrap()
+                .rel_paths_with_colors()
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+
+    let color_results: Vec<Option<Vec<crate::color::DominantColor>>> =
+        if opts.extract_colors && tags_db_opt.is_some() {
+            all_entries
+                .par_iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let needs = was_new_embed[i]
+                        || !color_cached_paths.contains(&entry.rel_path);
+                    if needs {
+                        match extract_dominant_colors(&entry.embed_path) {
+                            Ok(colors) => Some(colors),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "color extraction failed for {}: {e}",
+                                    entry.embed_path.display()
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None // already cached; Phase D will skip the write
+                    }
+                })
+                .collect()
+        } else {
+            vec![None; total]
+        };
+
     // ── Phase D: tags, SQLite writes, manifest collection ───────────────────
     // Sequential: TagsDb requires &mut self; manifest ordering must be stable.
     let mut embeddings: Vec<(PathBuf, Vec<f32>)> = Vec::with_capacity(total);
@@ -451,6 +501,15 @@ pub fn index_folder(
             let (vocab, vocab_vecs) = vocab_cache.as_ref().expect("vocabulary initialised");
             let assigned = tags_for_image(vec, vocab, vocab_vecs, opts.tag_threshold);
             db.upsert_image_tags(&entry.rel_path, &assigned)?;
+
+            if let Some(colors) = &color_results[i] {
+                if let Err(e) = db.upsert_image_colors(&entry.rel_path, colors) {
+                    tracing::warn!(
+                        "color store failed for {}: {e}",
+                        entry.embed_path.display()
+                    );
+                }
+            }
         }
 
         let id = i as u64;

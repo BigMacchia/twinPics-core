@@ -7,6 +7,7 @@
 
 #![warn(missing_docs)]
 
+pub mod color;
 pub mod db;
 pub mod error;
 pub mod indexer;
@@ -28,6 +29,9 @@ pub use manifest::{Manifest, ManifestEntry};
 pub use project::{
     default_project_root, find_project_for_source, list_projects, resolve_source_from_index_hint,
     ProjectConfig, ProjectPaths,
+};
+pub use color::{
+    color_match_score, extract_dominant_colors, search_project_colors, ColorHit, DominantColor,
 };
 pub use search::{search_project_image, search_project_text, SearchHit, SearchParams};
 pub use tags::{

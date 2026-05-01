@@ -1,9 +1,10 @@
 //! Tag vocabulary loading, CLIP similarity tagging, and `tags.sqlite` persistence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::color::DominantColor;
 use crate::ml::EmbeddingBackend;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -113,12 +114,7 @@ pub struct TagsDb {
 }
 
 impl TagsDb {
-    /// Create or open `tags.sqlite`, ensuring schema exists.
-    pub fn open_or_init(path: &Path) -> Result<Self, CoreError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(path)?;
+    fn apply_schema(conn: &Connection) -> Result<(), CoreError> {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS images (
@@ -131,16 +127,34 @@ impl TagsDb {
              );
              CREATE TABLE IF NOT EXISTS image_tags (
                image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-               tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-               score REAL NOT NULL,
+               tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
+               score    REAL    NOT NULL,
                PRIMARY KEY (image_id, tag_id)
              );
              CREATE INDEX IF NOT EXISTS idx_image_tags_tag ON image_tags(tag_id);
              CREATE TABLE IF NOT EXISTS meta (
                k TEXT PRIMARY KEY,
                v TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS colors (
+               image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+               r        INTEGER NOT NULL,
+               g        INTEGER NOT NULL,
+               b        INTEGER NOT NULL,
+               pct      REAL    NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_colors_image ON colors(image_id);",
         )?;
+        Ok(())
+    }
+
+    /// Create or open `tags.sqlite`, ensuring schema exists.
+    pub fn open_or_init(path: &Path) -> Result<Self, CoreError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        Self::apply_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -153,8 +167,13 @@ impl TagsDb {
             )));
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Self::apply_schema(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Open for color search — same as `open_existing` but returns `Ok(None)` if the file is missing.
+    pub fn open_for_color_search(path: &Path) -> Result<Self, CoreError> {
+        Self::open_existing(path)
     }
 
     /// Upsert meta key (e.g. `vocab_hash`, `tag_threshold`).
@@ -252,5 +271,77 @@ impl TagsDb {
     pub fn image_count(&self) -> Result<usize, CoreError> {
         let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))?;
         Ok(n as usize)
+    }
+
+    /// Replace dominant-color entries for one image.
+    pub fn upsert_image_colors(
+        &mut self,
+        rel_path: &str,
+        colors: &[DominantColor],
+    ) -> Result<(), CoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO images (rel_path) VALUES (?1)",
+            [rel_path],
+        )?;
+        let image_id: i64 = tx.query_row(
+            "SELECT id FROM images WHERE rel_path = ?1",
+            [rel_path],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM colors WHERE image_id = ?1", [image_id])?;
+        for c in colors {
+            tx.execute(
+                "INSERT INTO colors (image_id, r, g, b, pct) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![image_id, c.r as i64, c.g as i64, c.b as i64, c.pct],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load all image palettes as `(rel_path, colors)` pairs.
+    pub fn load_all_colors(&self) -> Result<Vec<(String, Vec<DominantColor>)>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.rel_path, c.r, c.g, c.b, c.pct
+             FROM colors c
+             JOIN images i ON i.id = c.image_id
+             ORDER BY i.id, c.pct DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u8,
+                r.get::<_, i64>(2)? as u8,
+                r.get::<_, i64>(3)? as u8,
+                r.get::<_, f64>(4)? as f32,
+            ))
+        })?;
+        let mut result: Vec<(String, Vec<DominantColor>)> = Vec::new();
+        for row in rows {
+            let (rel_path, r, g, b, pct) = row?;
+            let dc = DominantColor { r, g, b, pct };
+            if let Some(last) = result.last_mut() {
+                if last.0 == rel_path {
+                    last.1.push(dc);
+                    continue;
+                }
+            }
+            result.push((rel_path, vec![dc]));
+        }
+        Ok(result)
+    }
+
+    /// Set of `rel_path` values that already have color data stored.
+    pub fn rel_paths_with_colors(&self) -> Result<HashSet<String>, CoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT i.rel_path FROM colors c JOIN images i ON i.id = c.image_id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut set = HashSet::new();
+        for row in rows {
+            set.insert(row?);
+        }
+        Ok(set)
     }
 }

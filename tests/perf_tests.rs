@@ -133,6 +133,87 @@ fn resolve_source(env: &TestEnv) -> (PathBuf, bool) {
 
 // ── test ─────────────────────────────────────────────────────────────────────
 
+/// Compares indexing speed across option combinations to isolate cost of each phase.
+///
+/// Run with:
+///   $env:TWINPICS_BENCH_DIR = "D:\Marco\photos\2024"
+///   cargo test -p twinpics_core --features real-clip -- --ignored --nocapture bench_index_options
+#[test]
+#[serial]
+#[ignore = "benchmark — requires CLIP weights and TWINPICS_BENCH_DIR; run with --ignored --nocapture"]
+fn bench_index_options() {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let src = {
+        let key = if std::env::var("TWINPICS_BENCH_DIR").is_ok() {
+            "TWINPICS_BENCH_DIR"
+        } else {
+            "TWINPICS_PERF_SRC"
+        };
+        let p = std::env::var(key)
+            .unwrap_or_else(|_| panic!("set TWINPICS_BENCH_DIR (or TWINPICS_PERF_SRC) to a photo folder"));
+        let path = PathBuf::from(&p);
+        assert!(path.is_dir(), "{key}={p} is not an accessible directory");
+        path.canonicalize().unwrap()
+    };
+
+    println!("\n╔══ Benchmark: IndexOptions comparison  ({cpus} CPUs) ══╗");
+    println!("  source: {}", src.display());
+
+    struct BenchResult { label: &'static str, out: IndexOutcome }
+    let mut results: Vec<BenchResult> = Vec::new();
+
+    let configs: &[(&str, IndexOptions)] = &[
+        ("baseline (no tags, no colors)", IndexOptions {
+            skip_tagging: true,
+            extract_colors: false,
+            ..Default::default()
+        }),
+        ("tags, no colors", IndexOptions {
+            extract_colors: false,
+            ..Default::default()
+        }),
+        ("full  (tags + parallel colors)", IndexOptions::default()),
+    ];
+
+    for (label, opts) in configs {
+        let paths = project_paths_for_source(&src).unwrap();
+        twinpics_core::clean_project(&src).ok();
+        let backend = clip_backend();
+        let t0 = Instant::now();
+        let out = index_folder(&src, backend, &paths, opts.clone())
+            .unwrap_or_else(|e| panic!("index failed for {label}: {e}"));
+        let wall = t0.elapsed().as_millis();
+        println!(
+            "\n  [{label}]\n    files={:>5}  wall={:>6}ms  scan={:>5}ms  process={:>6}ms  write={:>5}ms",
+            out.file_count, wall, out.scan_ms, out.process_ms, out.finalize_ms
+        );
+        results.push(BenchResult { label, out });
+    }
+
+    println!("\n┌─ Overhead summary ────────────────────────────────────");
+    if results.len() >= 2 {
+        let base = results[0].out.total_ms as f64;
+        for r in &results[1..] {
+            let delta = r.out.total_ms as i64 - results[0].out.total_ms as i64;
+            println!("  {} vs baseline: {:+} ms", r.label, delta);
+        }
+        if results.len() >= 3 {
+            let tag_only = results[1].out.total_ms as f64;
+            let full = results[2].out.total_ms as f64;
+            if full > tag_only {
+                println!("  Color extraction overhead: {:.0} ms  ({:.1}x vs tags-only)",
+                    full - tag_only, full / tag_only.max(1.0));
+            }
+            let _ = base;
+        }
+    }
+    println!("└───────────────────────────────────────────────────────");
+    println!("╚═══════════════════════════════════════════════════════╝\n");
+}
+
 /// Measures `index_folder` performance: cold run (fresh embed) then warm run
 /// (all files cached from the first run).
 ///
